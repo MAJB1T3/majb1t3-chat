@@ -1,0 +1,14 @@
+{
+  "name": "majb1t3-chat",
+  "version": "0.1.0",
+  "description": "MAJB1T3 Chat: private chats with friends, no phone number needed.",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --no-warnings server.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "UNLICENSED"
+}
