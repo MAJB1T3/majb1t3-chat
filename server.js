@@ -15,6 +15,11 @@ const STORY_MS = 24 * 3600 * 1000;
 const STORY_MAX_VIDEO_SECONDS = 60;
 const MAX_UPLOAD = { image: 12e6, voice: 40e6, video: 80e6, file: 80e6 };
 const SESSION_DAYS = 365;
+const USER_QUOTA = (Number(process.env.USER_QUOTA_MB) || 500) * 1e6;   // media each person may store on the server
+const DECLINE_WAIT_MS = 24 * 3600 * 1000;                               // wait before asking again after a decline
+const MAX_DECLINES = 3;                                                 // after this many declines they can't ask again
+const INVITE_MAX_RESETS = 3, YEAR_MS = 365 * 86400e3;
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'chat.db'));
@@ -66,12 +71,56 @@ addColumn('users', 'email', 'TEXT');
 addColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('sessions', 'label', 'TEXT');
 addColumn('sessions', 'last_used', 'INTEGER');
+addColumn('users', 'invite_token', 'TEXT');
+addColumn('users', 'invite_resets', 'TEXT');
+addColumn('users', 'read_receipts', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('users', 'suspended', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'limited', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'pin_salt', 'TEXT');
+addColumn('users', 'pin_hash', 'TEXT');
+addColumn('chats', 'declined_at', 'INTEGER');
+addColumn('chats', 'decline_count', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('messages', 'size', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('messages', 'cid', 'TEXT');
+addColumn('stories', 'size', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('reports', 'status', "TEXT NOT NULL DEFAULT 'open'");
+addColumn('reports', 'context', 'TEXT');
+addColumn('reports', 'action', 'TEXT');
+addColumn('reports', 'handled_at', 'INTEGER');
+db.exec(`
+CREATE TABLE IF NOT EXISTS contact_names (
+  user_id INTEGER NOT NULL, contact_id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY(user_id, contact_id));
+CREATE TABLE IF NOT EXISTS stickers (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, media TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS notices (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, session_rowid INTEGER, created_at INTEGER NOT NULL, acked INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_cid ON messages(chat_id, sender, cid) WHERE cid IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_invite ON users(invite_token) WHERE invite_token IS NOT NULL;
+`);
+// older uploads did not record their size: fill it in once so storage limits count them
+for (const m of db.prepare("SELECT id, media FROM messages WHERE media IS NOT NULL AND size = 0").all()) {
+  try { db.prepare('UPDATE messages SET size = ? WHERE id = ?').run(fs.statSync(path.join(MEDIA_DIR, m.media)).size, m.id); } catch { /* file is gone */ }
+}
+for (const m of db.prepare("SELECT id, media FROM stories WHERE media IS NOT NULL AND size = 0").all()) {
+  try { db.prepare('UPDATE stories SET size = ? WHERE id = ?').run(fs.statSync(path.join(MEDIA_DIR, m.media)).size, m.id); } catch { /* file is gone */ }
+}
 
 const q = (sql) => db.prepare(sql);
 const now = () => Date.now();
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
 const b64uDecode = (s) => Buffer.from(String(s), 'base64url');
+
+// ---------- error log (data/errors.log, rotates at 1 MB) ----------
+const LOG_FILE = path.join(DATA_DIR, 'errors.log');
+function logLine(kind, text) {
+  try {
+    try { if (fs.statSync(LOG_FILE).size > 1e6) fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch { /* no file yet */ }
+    fs.appendFileSync(LOG_FILE, new Date().toISOString() + ' [' + kind + '] ' + String(text).replace(/\s+/g, ' ').slice(0, 1500) + '\n');
+  } catch { /* logging must never break the app */ }
+}
+process.on('uncaughtException', (e) => { console.error(e); logLine('crash', e && e.stack || e); });
+process.on('unhandledRejection', (e) => { console.error(e); logLine('rejection', e && e.stack || e); });
 
 // ---------- helpers ----------
 class HttpError extends Error {
@@ -127,11 +176,12 @@ function originOf(req) {
 }
 function newSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  q('INSERT INTO sessions (token_hash, user_id, created_at, label, last_used) VALUES (?,?,?,?,?)')
+  const info = q('INSERT INTO sessions (token_hash, user_id, created_at, label, last_used) VALUES (?,?,?,?,?)')
     .run(sha(token), userId, now(), deviceLabel(req.headers['user-agent']), now());
   const attrs = ['b1t3=' + token, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=' + SESSION_DAYS * 86400];
   if (isHttps(req)) attrs.push('Secure');
   res.setHeader('Set-Cookie', attrs.join('; '));
+  return Number(info.lastInsertRowid);
 }
 function clearSession(req, res) {
   const t = parseCookies(req).b1t3;
@@ -144,12 +194,13 @@ function authUser(req) {
   const th = sha(t);
   const row = q('SELECT u.*, s.last_used AS _lu FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?').get(th);
   if (!row) return null;
+  if (row.suspended) { req._suspended = true; return null; }
   if (!row._lu || now() - row._lu > 60000) q('UPDATE sessions SET last_used = ? WHERE token_hash = ?').run(now(), th);
   return row;
 }
 function needUser(req) {
   const u = authUser(req);
-  if (!u) fail(401, 'Please sign in again.');
+  if (!u) fail(401, req._suspended ? 'Your account has been suspended.' : 'Please sign in again.');
   return u;
 }
 function currentSessionRowid(req) {
@@ -166,6 +217,22 @@ function rateLimit(req, bucket, max, windowMs) {
   if (arr.length >= max) fail(429, 'Too many tries. Please wait a few minutes and try again.');
   arr.push(t);
   hits.set(key, arr);
+}
+
+function userLimit(user, bucket, max, windowMs) {
+  const key = bucket + ':u' + user.id;
+  const t = now();
+  const arr = (hits.get(key) || []).filter((x) => t - x < windowMs);
+  if (arr.length >= max) fail(429, 'You are doing that too fast. Please wait a moment.');
+  arr.push(t); hits.set(key, arr);
+}
+function usedBytes(uid) {
+  return q("SELECT COALESCE(SUM(size),0) n FROM messages WHERE sender = ? AND media IS NOT NULL AND deleted_all = 0").get(uid).n
+    + q('SELECT COALESCE(SUM(size),0) n FROM stories WHERE user_id = ?').get(uid).n
+    + q('SELECT COALESCE(SUM(size),0) n FROM stickers WHERE user_id = ?').get(uid).n;
+}
+function checkQuota(user, incoming) {
+  if (usedBytes(user.id) + (incoming || 0) > USER_QUOTA) fail(413, 'You have used all of your ' + Math.round(USER_QUOTA / 1e6) + ' MB of storage. Delete some old photos or videos to free space.');
 }
 
 async function readJson(req, limit = 200e3) {
@@ -315,8 +382,9 @@ function partners(uid) {
     .all(uid, uid, uid).map((r) => r.pid);
 }
 function broadcastPresence(uid) {
-  const u = q('SELECT last_seen FROM users WHERE id = ?').get(uid);
-  for (const pid of partners(uid)) push(pid, 'presence', { userId: uid, online: isOnline(uid), lastSeen: u ? u.last_seen : 0 });
+  const u = q('SELECT * FROM users WHERE id = ?').get(uid);
+  if (!u) return;
+  for (const pid of partners(uid)) push(pid, 'presence', Object.assign({ userId: uid }, presenceFor(pid, u, { status: 'accepted' })));
 }
 function markDeliveredFor(uid) {
   const rows = q(`SELECT m.id, m.chat_id, m.sender FROM messages m JOIN chats c ON c.id = m.chat_id
@@ -372,13 +440,31 @@ function prefsOf(chatId, userId) {
 }
 function chatState(c, userId) {
   if (c.status === 'pending') return c.requester === userId ? 'waiting' : 'request';
+  if (c.status === 'declined') return c.requester === userId ? 'declined' : 'declined-by-me';
   if (c.status === 'blocked') return c.blocked_by === userId ? 'blocked' : 'blocked-by-them';
   return c.status;
 }
-function publicUser(u, chat) {
-  // last seen and online are always visible to accepted friends; strangers see nothing
-  const friend = chat && chat.status === 'accepted';
-  return { id: u.id, nickname: u.nickname, avatar: u.avatar || null, online: friend ? isOnline(u.id) : false, lastSeen: friend ? u.last_seen : null };
+const receiptsOn = (uid) => { const r = q('SELECT read_receipts FROM users WHERE id = ?').get(uid); return !r || r.read_receipts !== 0; };
+function vagueSeen(ts) {
+  const age = now() - (ts || 0), day = 86400e3;
+  return age < 7 * day ? 'recently' : age < 14 * day ? 'week' : age < 30 * day ? 'weeks' : 'long';
+}
+// exact last seen only when BOTH people keep read receipts on; otherwise a vague answer. "Online" is always shown to accepted friends.
+function presenceFor(viewerId, u, chat) {
+  if (!chat || chat.status !== 'accepted') return { online: false, lastSeen: null, lastSeenVague: null };
+  const exact = receiptsOn(viewerId) && receiptsOn(u.id);
+  return { online: isOnline(u.id), lastSeen: exact ? u.last_seen : null, lastSeenVague: exact ? null : vagueSeen(u.last_seen) };
+}
+function publicUser(u, chat, viewerId) {
+  const nm = viewerId ? q('SELECT name FROM contact_names WHERE user_id = ? AND contact_id = ?').get(viewerId, u.id) : null;
+  return Object.assign({ id: u.id, nickname: u.nickname, avatar: u.avatar || null, savedName: nm ? nm.name : null }, presenceFor(viewerId, u, chat));
+}
+function chatExtra(c, userId) {
+  return {
+    previouslyDeclined: (c.decline_count || 0) > 0,
+    retryAt: c.status === 'declined' && c.requester === userId ? (c.declined_at || 0) + DECLINE_WAIT_MS : null,
+    canRetry: c.status === 'declined' && c.requester === userId && (c.decline_count || 0) < MAX_DECLINES
+  };
 }
 function previewOf(m) {
   if (!m) return '';
@@ -397,10 +483,16 @@ function shapeMessage(m, viewerId) {
     id: m.id, chatId: m.chat_id, mine, type: m.type, createdAt: m.created_at,
     deleted: !!m.deleted_all, edited: !!m.edited_at, once: !!m.once, opened: !!m.opened_at,
     duration: m.duration || 0, fileName: m.file_name || null, mime: m.mime || null,
-    delivered: !!m.delivered_at, seen: !!m.seen_at,
+    delivered: !!m.delivered_at, seen: false,
     text: m.deleted_all ? '' : (m.text || ''),
     hasMedia: !m.deleted_all && !!m.media, replyTo: null, reactions: [], starred: false
   };
+  out.seen = !!m.seen_at;
+  if (out.seen && mine) { // blue ticks only when both people keep read receipts on
+    const c = q('SELECT user_a, user_b FROM chats WHERE id = ?').get(m.chat_id);
+    const other = c ? (c.user_a === viewerId ? c.user_b : c.user_a) : 0;
+    out.seen = receiptsOn(viewerId) && receiptsOn(other);
+  }
   if (m.edited_at && !m.deleted_all && mine) out.original = m.original_text;
   if (m.reply_to) {
     const r = q('SELECT id, sender, type, text, file_name, once, deleted_all FROM messages WHERE id = ?').get(m.reply_to);
@@ -438,13 +530,12 @@ function listChats(user) {
     const otherId = c.user_a === user.id ? c.user_b : c.user_a;
     const p = prefsOf(c.id, user.id);
     if (p.hidden) continue;
-    if (c.status === 'declined' && c.requester !== user.id) continue;
     const other = q('SELECT * FROM users WHERE id = ?').get(otherId);
     const last = q(`SELECT m.* FROM messages m WHERE ${VISIBLE_SQL} ORDER BY m.id DESC LIMIT 1`).get(c.id, p.cleared_at, user.id);
     const unread = q(`SELECT COUNT(*) n FROM messages m WHERE ${VISIBLE_SQL} AND m.sender != ? AND m.seen_at IS NULL AND m.deleted_all = 0`)
       .get(c.id, p.cleared_at, user.id, user.id).n;
     out.push({
-      id: c.id, state: chatState(c, user.id), user: publicUser(other, c), pinned: !!p.pinned, muted: !!p.muted, unread,
+      id: c.id, state: chatState(c, user.id), user: publicUser(other, c, user.id), ...chatExtra(c, user.id), pinned: !!p.pinned, muted: !!p.muted, unread,
       last: last ? { preview: previewOf(last), mine: last.sender === user.id, at: last.created_at } : null,
       updatedAt: last ? last.created_at : c.created_at
     });
@@ -454,16 +545,18 @@ function listChats(user) {
 function me(user) {
   return {
     id: user.id, nickname: user.nickname, code: user.code, avatar: user.avatar || null,
-    hasEmail: !!user.email, emailMasked: maskEmail(user.email), emailVerified: !!user.email_verified, mailEnabled: MAIL_ENABLED
+    hasEmail: !!user.email, emailMasked: maskEmail(user.email), emailVerified: !!user.email_verified, mailEnabled: MAIL_ENABLED,
+    readReceipts: user.read_receipts !== 0, hasRecoveryPin: !!user.pin_hash, limited: !!user.limited,
+    storageUsed: usedBytes(user.id), storageLimit: USER_QUOTA
   };
 }
 
 // ---------- message creation ----------
 function createMessage(user, chat, fields) {
   const t = now();
-  const info = q(`INSERT INTO messages (chat_id, sender, type, text, media, mime, file_name, duration, once, reply_to, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(chat.id, user.id, fields.type, fields.text || null, fields.media || null,
-    fields.mime || null, fields.fileName || null, fields.duration || null, fields.once ? 1 : 0, fields.replyTo || null, t);
+  const info = q(`INSERT INTO messages (chat_id, sender, type, text, media, mime, file_name, duration, once, reply_to, created_at, size, cid)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(chat.id, user.id, fields.type, fields.text || null, fields.media || null,
+    fields.mime || null, fields.fileName || null, fields.duration || null, fields.once ? 1 : 0, fields.replyTo || null, t, fields.size || 0, fields.cid || null);
   const id = Number(info.lastInsertRowid);
   // a new message brings a deleted/hidden chat back
   q('INSERT OR IGNORE INTO chat_prefs (chat_id, user_id) VALUES (?,?)').run(chat.id, chat.other);
@@ -479,6 +572,8 @@ function createMessage(user, chat, fields) {
   return shapeMessage(row, user.id);
 }
 function assertCanSend(user, chat) {
+  const o = q('SELECT suspended FROM users WHERE id = ?').get(chat.other);
+  if (!o || o.suspended) fail(403, 'This person isn’t available right now.');
   if (chat.status === 'blocked') fail(403, chat.blocked_by === user.id ? 'You blocked this person. Unblock to send messages.' : 'You can’t send messages to this person.');
   if (chat.status === 'declined') fail(403, 'This person isn’t accepting messages from you.');
   if (chat.status === 'pending') fail(403, chat.requester === user.id ? 'Waiting for them to accept your request.' : 'Accept the request first to reply.');
@@ -535,9 +630,24 @@ route('POST', '/api/create', async (req, res) => {
     .run(nickname, code, email || null, 0, null, t, t);
   const user = q('SELECT * FROM users WHERE id = ?').get(Number(info.lastInsertRowid));
   newSession(req, res, user.id);
+  logLine('signup', 'new account ' + user.id);
   if (email && MAIL_ENABLED) sendOtp(user, 'verify', email).catch(() => {});
   send(res, 200, { me: me(user) });
 });
+
+const pinFails = new Map(); // userId -> {n, until}
+function pinLocked(uid) { const f = pinFails.get(uid); if (f && f.until > now()) fail(429, 'Too many wrong tries on this account. Wait 15 minutes and try again.'); }
+function pinFailed(uid) { const f = pinFails.get(uid) || { n: 0, until: 0 }; f.n++; if (f.n >= 5) { f.until = now() + 15 * 60e3; f.n = 0; } pinFails.set(uid, f); }
+function pinHash(pin, salt) { return crypto.scryptSync(String(pin), salt, 32).toString('hex'); }
+function pinOk(u, pin) {
+  if (!u.pin_hash || !pin) return false;
+  const a = Buffer.from(pinHash(pin, u.pin_salt)), b = Buffer.from(u.pin_hash);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function addNotice(userId, kind, text, sessionRowid) {
+  q('INSERT INTO notices (user_id, kind, text, session_rowid, created_at) VALUES (?,?,?,?,?)').run(userId, kind, text || null, sessionRowid || null, now());
+  push(userId, 'notice', {});
+}
 
 route('POST', '/api/recover', async (req, res) => {
   rateLimit(req, 'recover', 10, 600e3);
@@ -546,20 +656,110 @@ route('POST', '/api/recover', async (req, res) => {
   const u = q('SELECT * FROM users WHERE code = ?').get(code);
   const ok = u && u.nickname.toLowerCase() === nickname && u.email && email && u.email === email;
   if (!ok) fail(401, 'Those details don’t match. Check the nickname, room code and Gmail.');
+  if (u.suspended) fail(403, 'This account has been suspended.');
+  pinLocked(u.id);
+  // Your nickname and room code are known to your friends, so recovery needs something only you have.
+  if (!MAIL_ENABLED && !u.pin_hash) fail(403, 'Recovery isn’t switched on for this account. While you’re signed in, open Settings and set a recovery PIN. Without one, this account can’t be recovered.');
+  if (u.pin_hash) {
+    if (!b.pin) { send(res, 200, { needPin: true }); return; }
+    if (!pinOk(u, b.pin)) { pinFailed(u.id); fail(401, 'That recovery PIN isn’t right.'); }
+  }
   if (MAIL_ENABLED) {
     if (!u.email_verified) fail(403, 'That Gmail was never confirmed, so it can’t be used to recover this room.');
     if (!b.otp) { await sendOtp(u, 'recover', u.email); send(res, 200, { needCode: true, sentTo: maskEmail(u.email) }); return; }
-    checkOtp(u, 'recover', b.otp);
+    try { checkOtp(u, 'recover', b.otp); } catch (e) { pinFailed(u.id); throw e; }
   }
-  newSession(req, res, u.id);
+  const rowid = newSession(req, res, u.id);
+  const label = deviceLabel(req.headers['user-agent']);
+  addNotice(u.id, 'device', label, rowid);
+  q('SELECT * FROM push_subs WHERE user_id = ?').all(u.id).forEach((sub) => pushTo(sub, { title: 'New device signed in', body: label + '. If this wasn’t you, remove it in Settings.', tag: 'device' }));
+  logLine('recover', 'user ' + u.id + ' signed in on ' + label);
   send(res, 200, { me: me(u) });
+});
+
+route('POST', '/api/recovery-pin', async (req, res) => {
+  const u = needUser(req);
+  rateLimit(req, 'pin', 20, 600e3);
+  const b = await readJson(req);
+  if (u.pin_hash) { pinLocked(u.id); if (!pinOk(u, b.current)) { pinFailed(u.id); fail(401, 'Your current recovery PIN isn’t right.'); } }
+  if (b.remove) {
+    if (!u.pin_hash) fail(400, 'No recovery PIN is set.');
+    q('UPDATE users SET pin_hash = NULL, pin_salt = NULL WHERE id = ?').run(u.id);
+  } else {
+    if (!/^\d{6,12}$/.test(String(b.pin || ''))) fail(400, 'Use 6 to 12 digits.');
+    const salt = crypto.randomBytes(16).toString('hex');
+    q('UPDATE users SET pin_salt = ?, pin_hash = ? WHERE id = ?').run(salt, pinHash(b.pin, salt), u.id);
+  }
+  send(res, 200, { me: me(q('SELECT * FROM users WHERE id = ?').get(u.id)) });
+});
+
+route('GET', '/api/notices', async (req, res) => {
+  const u = needUser(req);
+  const cur = currentSessionRowid(req);
+  const rows = q('SELECT id, kind, text, created_at FROM notices WHERE user_id = ? AND acked = 0 AND (session_rowid IS NULL OR session_rowid != ?) ORDER BY id DESC LIMIT 20').all(u.id, cur || -1);
+  send(res, 200, { notices: rows.map((r) => ({ id: r.id, kind: r.kind, text: r.text, createdAt: r.created_at })) });
+});
+route('POST', '/api/notices/ack', async (req, res) => {
+  const u = needUser(req);
+  const b = await readJson(req);
+  for (const id of (Array.isArray(b.ids) ? b.ids : []).slice(0, 50)) q('UPDATE notices SET acked = 1 WHERE id = ? AND user_id = ?').run(Number(id), u.id);
+  send(res, 200, { ok: true });
+});
+
+route('POST', '/api/privacy', async (req, res) => {
+  const u = needUser(req);
+  const b = await readJson(req);
+  if (typeof b.readReceipts === 'boolean') q('UPDATE users SET read_receipts = ? WHERE id = ?').run(b.readReceipts ? 1 : 0, u.id);
+  broadcastPresence(u.id);
+  for (const pid of partners(u.id)) push(pid, 'chat', {});
+  send(res, 200, { me: me(q('SELECT * FROM users WHERE id = ?').get(u.id)) });
+});
+
+// ----- invite link: a separate token, so the room code is never inside the link -----
+function userResets(user) {
+  let arr = []; try { arr = JSON.parse(user.invite_resets || '[]'); } catch { arr = []; }
+  arr = arr.filter((x) => now() - x < YEAR_MS);
+  return { arr, left: Math.max(0, INVITE_MAX_RESETS - arr.length), nextAt: arr.length >= INVITE_MAX_RESETS ? Math.min(...arr) + YEAR_MS : null };
+}
+function inviteInfo(req, user) {
+  let token = user.invite_token;
+  if (!token) { token = crypto.randomBytes(12).toString('base64url'); q('UPDATE users SET invite_token = ? WHERE id = ?').run(token, user.id); }
+  const r = userResets(user);
+  return { token, url: originOf(req) + '/#add=' + token, resetsLeft: r.left, maxResets: INVITE_MAX_RESETS, nextResetAt: r.nextAt };
+}
+route('GET', '/api/invite', async (req, res) => { send(res, 200, inviteInfo(req, needUser(req))); });
+route('POST', '/api/invite/reset', async (req, res) => {
+  const user = needUser(req);
+  const r = userResets(user);
+  if (!r.left) fail(429, 'You have used all ' + INVITE_MAX_RESETS + ' invite resets for this year. You can reset again on ' + new Date(r.nextAt).toDateString() + '.');
+  r.arr.push(now());
+  q('UPDATE users SET invite_token = ?, invite_resets = ? WHERE id = ?').run(crypto.randomBytes(12).toString('base64url'), JSON.stringify(r.arr), user.id);
+  send(res, 200, inviteInfo(req, q('SELECT * FROM users WHERE id = ?').get(user.id)));
+});
+route('GET', '/api/invite/preview', async (req, res, params, url) => {
+  rateLimit(req, 'invprev', 60, 600e3);
+  const t = String(url.searchParams.get('token') || '');
+  const f = t ? q('SELECT * FROM users WHERE invite_token = ?').get(t) : null;
+  if (!f || f.suspended) fail(404, 'This invite is no longer valid. Ask your friend for a new one.');
+  send(res, 200, { nickname: f.nickname, avatar: f.avatar || null });
+});
+
+// ----- contact (saved) names -----
+route('POST', '/api/chats/:id/contact-name', async (req, res, params) => {
+  const user = needUser(req);
+  const chat = getChatFor(user, params.id);
+  const b = await readJson(req);
+  const name = String(b.name || '').trim().slice(0, 40);
+  if (!name) q('DELETE FROM contact_names WHERE user_id = ? AND contact_id = ?').run(user.id, chat.other);
+  else q('INSERT INTO contact_names (user_id, contact_id, name) VALUES (?,?,?) ON CONFLICT(user_id, contact_id) DO UPDATE SET name = excluded.name').run(user.id, chat.other, name);
+  send(res, 200, { savedName: name || null });
 });
 
 route('POST', '/api/logout', async (req, res) => { clearSession(req, res); send(res, 200, { ok: true }); });
 
 route('GET', '/api/me', async (req, res) => {
   const u = authUser(req);
-  send(res, 200, { me: u ? me(u) : null, config: { mailEnabled: MAIL_ENABLED, maxStoryVideoSeconds: STORY_MAX_VIDEO_SECONDS } });
+  send(res, 200, { me: u ? me(u) : null, suspended: !!req._suspended, config: { mailEnabled: MAIL_ENABLED, maxStoryVideoSeconds: STORY_MAX_VIDEO_SECONDS } });
 });
 
 route('POST', '/api/avatar', async (req, res) => {
@@ -608,21 +808,52 @@ route('POST', '/api/join', async (req, res) => {
   const user = needUser(req);
   rateLimit(req, 'join', 30, 3600e3);
   const b = await readJson(req);
-  const nickname = normNick(b.nickname).toLowerCase(), code = normCode(b.code);
   const text = String(b.text || '').trim().slice(0, 4000);
-  const friend = q('SELECT * FROM users WHERE code = ?').get(code);
-  if (!friend || friend.nickname.toLowerCase() !== nickname) fail(404, 'No one found with that nickname and room code.');
-  if (friend.id === user.id) fail(400, 'That is your own room code.');
+  let friend;
+  if (b.chatId) { // asking again inside an existing chat
+    const c0 = getChatFor(user, b.chatId);
+    friend = q('SELECT * FROM users WHERE id = ?').get(c0.other);
+    if (!friend || friend.suspended) fail(404, 'This person isn’t available right now.');
+  } else if (b.invite) {
+    friend = q('SELECT * FROM users WHERE invite_token = ?').get(String(b.invite));
+    if (!friend || friend.suspended) fail(404, 'This invite is no longer valid. Ask your friend for a new one.');
+  } else {
+    const nickname = normNick(b.nickname).toLowerCase(), code = normCode(b.code);
+    friend = q('SELECT * FROM users WHERE code = ?').get(code);
+    if (!friend || friend.suspended || friend.nickname.toLowerCase() !== nickname) fail(404, 'No one found with that nickname and room code.');
+  }
+  if (friend.id === user.id) fail(400, 'That is your own invite.');
   const [a, bb] = pairKey(user.id, friend.id);
   let chat = q('SELECT * FROM chats WHERE user_a = ? AND user_b = ?').get(a, bb);
   if (chat) {
     chat.other = friend.id;
-    if (chat.status === 'declined' || chat.status === 'blocked') fail(403, 'This person isn’t accepting messages from you.');
+    if (chat.status === 'blocked') fail(403, 'This person isn’t accepting messages from you.');
+    if (chat.status === 'declined') {
+      if (chat.requester !== user.id) { // you declined them before; reaching out yourself accepts them
+        q("UPDATE chats SET status = 'accepted' WHERE id = ?").run(chat.id);
+        push(friend.id, 'chat', { chatId: chat.id });
+        chat.status = 'accepted';
+      } else {
+        if (chat.decline_count >= MAX_DECLINES) fail(403, 'This person isn’t accepting requests from you.');
+        const wait = (chat.declined_at || 0) + DECLINE_WAIT_MS - now();
+        if (wait > 0) fail(403, 'They declined your request. You can ask again in ' + Math.max(1, Math.ceil(wait / 3600e3)) + ' hour(s).');
+        if (!text) fail(400, 'Write a message so they know it’s you.');
+        if (user.limited) fail(403, 'Your account is limited while we review reports, so you can’t send new requests.');
+        q("UPDATE chats SET status = 'pending', requester = ? WHERE id = ?").run(user.id, chat.id);
+        chat.status = 'pending'; chat.requester = user.id;
+        userLimit(user, 'msg', 120, 60e3);
+        createMessage(user, chat, { type: 'text', text });
+        push(friend.id, 'chat', { chatId: chat.id });
+        send(res, 200, { chatId: chat.id, state: 'waiting' });
+        return;
+      }
+    }
     prefsOf(chat.id, user.id);
     q('UPDATE chat_prefs SET hidden = 0 WHERE chat_id = ? AND user_id = ?').run(chat.id, user.id);
     send(res, 200, { chatId: chat.id, state: chatState(chat, user.id) });
     return;
   }
+  if (user.limited) fail(403, 'Your account is limited while we review reports, so you can’t send new requests.');
   if (!text) fail(400, 'Write a first message. Your friend sees it as a request.');
   const info = q("INSERT INTO chats (user_a, user_b, requester, status, created_at) VALUES (?,?,?,'pending',?)").run(a, bb, user.id, now());
   chat = q('SELECT * FROM chats WHERE id = ?').get(Number(info.lastInsertRowid));
@@ -643,12 +874,12 @@ function chatAction(name, fn) {
   });
 }
 chatAction('accept', (user, chat) => {
-  if (chat.status !== 'pending' || chat.requester === user.id) fail(400, 'Nothing to accept.');
+  if (!['pending', 'declined'].includes(chat.status) || chat.requester === user.id) fail(400, 'Nothing to accept.');
   q("UPDATE chats SET status = 'accepted' WHERE id = ?").run(chat.id);
 });
 chatAction('decline', (user, chat) => {
   if (chat.status !== 'pending' || chat.requester === user.id) fail(400, 'Nothing to decline.');
-  q("UPDATE chats SET status = 'declined' WHERE id = ?").run(chat.id);
+  q("UPDATE chats SET status = 'declined', declined_at = ?, decline_count = decline_count + 1 WHERE id = ?").run(now(), chat.id);
 });
 chatAction('block', (user, chat, body) => {
   if (body.on === false) {
@@ -666,16 +897,29 @@ chatAction('delete', (user, chat) => {
   prefsOf(chat.id, user.id);
   q('UPDATE chat_prefs SET hidden = 1, cleared_at = ? WHERE chat_id = ? AND user_id = ?').run(now(), chat.id, user.id);
 });
-chatAction('report', (user, chat, body) => {
-  const reason = String(body.reason || '').trim().slice(0, 300) || 'Not specified';
-  q('INSERT INTO reports (reporter, reported, chat_id, reason, created_at) VALUES (?,?,?,?,?)').run(user.id, chat.other, chat.id, reason, now());
+route('POST', '/api/chats/:id/report', async (req, res, params) => {
+  const user = needUser(req);
+  const chat = getChatFor(user, params.id);
+  userLimit(user, 'report', 20, 86400e3);
+  const b = await readJson(req);
+  const reason = String(b.reason || '').trim().slice(0, 300) || 'Not specified';
+  let context = null;
+  if (b.includeMessages) { // only if the reporter chose to share their recent messages from this person
+    const rows = q("SELECT type, text, file_name, created_at FROM messages WHERE chat_id = ? AND sender = ? AND deleted_all = 0 ORDER BY id DESC LIMIT 10").all(chat.id, chat.other);
+    context = JSON.stringify(rows.reverse().map((r) => ({ at: r.created_at, type: r.type, text: r.type === 'text' ? String(r.text || '').slice(0, 500) : (r.file_name || r.type) })));
+  }
+  q('INSERT INTO reports (reporter, reported, chat_id, reason, created_at, context) VALUES (?,?,?,?,?,?)').run(user.id, chat.other, chat.id, reason, now(), context);
+  if (chat.status === 'accepted' || chat.status === 'pending') q("UPDATE chats SET status = 'blocked', blocked_by = ? WHERE id = ?").run(user.id, chat.id);
+  const n = q('SELECT COUNT(DISTINCT reporter) n FROM reports WHERE reported = ? AND created_at > ?').get(chat.other, now() - 7 * 86400e3).n;
+  if (n >= 3) { q('UPDATE users SET limited = 1 WHERE id = ?').run(chat.other); logLine('auto-limit', 'user ' + chat.other + ' limited after ' + n + ' reports'); }
+  send(res, 200, { ok: true, blocked: true });
 });
 chatAction('seen', (user, chat) => {
   const rows = q('SELECT id FROM messages WHERE chat_id = ? AND sender != ? AND seen_at IS NULL').all(chat.id, user.id);
   if (!rows.length) return;
   const t = now();
   q('UPDATE messages SET seen_at = ?, delivered_at = COALESCE(delivered_at, ?) WHERE chat_id = ? AND sender != ? AND seen_at IS NULL').run(t, t, chat.id, user.id);
-  push(chat.other, 'seen', { chatId: chat.id, ids: rows.map((r) => r.id), at: t });
+  if (receiptsOn(user.id) && receiptsOn(chat.other)) push(chat.other, 'seen', { chatId: chat.id, ids: rows.map((r) => r.id), at: t });
 });
 
 route('GET', '/api/chats/:id/messages', async (req, res, params, url) => {
@@ -688,7 +932,7 @@ route('GET', '/api/chats/:id/messages', async (req, res, params, url) => {
   if (around) ({ messages, hasMore } = messagesAround(user, chat, around));
   else { messages = visibleMessages(user, chat, Number(url.searchParams.get('before')) || 0, 60); hasMore = messages.length >= 60; }
   send(res, 200, {
-    chat: { id: chat.id, state: chatState(chat, user.id), user: publicUser(other, chat), prefs: { pinned: !!p.pinned, muted: !!p.muted } },
+    chat: Object.assign({ id: chat.id, state: chatState(chat, user.id), user: publicUser(other, chat, user.id), prefs: { pinned: !!p.pinned, muted: !!p.muted } }, chatExtra(chat, user.id)),
     messages, hasMore
   });
 });
@@ -719,17 +963,32 @@ route('POST', '/api/chats/:id/messages', async (req, res, params) => {
   const user = needUser(req);
   const chat = getChatFor(user, params.id);
   assertCanSend(user, chat);
+  userLimit(user, 'msg', 120, 60e3);
   const b = await readJson(req);
+  const cid = b.cid ? String(b.cid).slice(0, 40) : null; // lets the app safely retry a message that may have gone through
+  if (cid) {
+    const ex = q('SELECT * FROM messages WHERE chat_id = ? AND sender = ? AND cid = ?').get(chat.id, user.id, cid);
+    if (ex) { send(res, 200, { message: shapeMessage(ex, user.id) }); return; }
+  }
   if (b.type === 'sticker') {
     const id = String(b.text || '');
+    if (/^c:\d+$/.test(id)) { // one of your own saved stickers
+      const st = q('SELECT * FROM stickers WHERE id = ? AND user_id = ?').get(Number(id.slice(2)), user.id);
+      if (!st) fail(404, 'That sticker isn’t available.');
+      checkQuota(user, st.size);
+      const media = crypto.randomBytes(16).toString('hex');
+      try { fs.copyFileSync(path.join(MEDIA_DIR, st.media), path.join(MEDIA_DIR, media)); } catch { fail(410, 'That sticker is no longer available.'); }
+      send(res, 200, { message: createMessage(user, chat, { type: 'sticker', text: id, media, mime: st.mime, size: st.size, replyTo: replyIdFor(chat, b.replyTo), cid }) });
+      return;
+    }
     if (!/^(e:.{1,16}|t:[a-z0-9]{1,16})$/u.test(id)) fail(400, 'That sticker isn’t available.');
-    send(res, 200, { message: createMessage(user, chat, { type: 'sticker', text: id, replyTo: replyIdFor(chat, b.replyTo) }) });
+    send(res, 200, { message: createMessage(user, chat, { type: 'sticker', text: id, replyTo: replyIdFor(chat, b.replyTo), cid }) });
     return;
   }
   const text = String(b.text || '').trim();
   if (!text) fail(400, 'Write something first.');
   if (text.length > 4000) fail(400, 'That message is too long.');
-  send(res, 200, { message: createMessage(user, chat, { type: 'text', text, replyTo: replyIdFor(chat, b.replyTo) }) });
+  send(res, 200, { message: createMessage(user, chat, { type: 'text', text, replyTo: replyIdFor(chat, b.replyTo), cid }) });
 });
 
 route('POST', '/api/chats/:id/media', async (req, res, params, url) => {
@@ -742,10 +1001,17 @@ route('POST', '/api/chats/:id/media', async (req, res, params, url) => {
   if (type === 'image' && !/^image\/(jpeg|png|webp|gif|heic|heif)$/.test(mime)) fail(400, 'That image type is not supported.');
   if (type === 'voice' && !/^audio\//.test(mime)) fail(400, 'That audio type is not supported.');
   if (type === 'video' && !/^video\//.test(mime)) fail(400, 'That video type is not supported.');
-  const { id } = await receiveUpload(req, MAX_UPLOAD[type]);
+  userLimit(user, 'media', 60, 60e3);
+  const cid = url.searchParams.get('cid') ? String(url.searchParams.get('cid')).slice(0, 40) : null;
+  if (cid) {
+    const ex = q('SELECT * FROM messages WHERE chat_id = ? AND sender = ? AND cid = ?').get(chat.id, user.id, cid);
+    if (ex) { send(res, 200, { message: shapeMessage(ex, user.id) }); return; }
+  }
+  checkQuota(user, Number(req.headers['content-length']) || 0);
+  const { id, size } = await receiveUpload(req, MAX_UPLOAD[type]);
   const fileName = String(url.searchParams.get('name') || '').replace(/[\r\n\\/]/g, '').slice(0, 120) || null;
   const msg = createMessage(user, chat, {
-    type, media: id, mime, fileName, duration: Math.min(Number(url.searchParams.get('dur')) || 0, 86400),
+    type, media: id, mime, size, cid, fileName, duration: Math.min(Number(url.searchParams.get('dur')) || 0, 86400),
     once: url.searchParams.get('once') === '1', replyTo: replyIdFor(chat, url.searchParams.get('reply')),
     text: String(url.searchParams.get('caption') || '').slice(0, 1000)
   });
@@ -762,12 +1028,13 @@ route('POST', '/api/chats/:id/forward', async (req, res, params) => {
   getChatFor(user, src.chat_id);
   if (src.deleted_all || q('SELECT 1 FROM hidden_messages WHERE message_id = ? AND user_id = ?').get(src.id, user.id)) fail(404, 'Message not found.');
   if (src.once) fail(400, 'View once messages can’t be forwarded.');
+  if (src.media) checkQuota(user, src.size || 0);
   let media = null;
   if (src.media) {
     media = crypto.randomBytes(16).toString('hex');
     try { fs.copyFileSync(path.join(MEDIA_DIR, src.media), path.join(MEDIA_DIR, media)); } catch { fail(410, 'That file is no longer available.'); }
   }
-  send(res, 200, { message: createMessage(user, chat, { type: src.type, text: src.text, media, mime: src.mime, fileName: src.file_name, duration: src.duration }) });
+  send(res, 200, { message: createMessage(user, chat, { type: src.type, text: src.text, media, size: src.size, mime: src.mime, fileName: src.file_name, duration: src.duration }) });
 });
 
 function getMessageFor(user, id) {
@@ -845,7 +1112,7 @@ route('GET', '/api/starred', async (req, res) => {
   const items = rows.map((m) => {
     const chat = getChatFor(user, m.chat_id);
     const other = q('SELECT * FROM users WHERE id = ?').get(chat.other);
-    return { message: shapeMessage(m, user.id), chatId: chat.id, user: publicUser(other, chat) };
+    return { message: shapeMessage(m, user.id), chatId: chat.id, user: publicUser(other, chat, user.id) };
   });
   send(res, 200, { items });
 });
@@ -884,7 +1151,7 @@ route('GET', '/api/stories', async (req, res) => {
     if (!rows.length) continue;
     const u = q('SELECT * FROM users WHERE id = ?').get(pid);
     const stories = rows.map((s) => storyShape(s, user.id));
-    friends.push({ user: { id: u.id, nickname: u.nickname, avatar: u.avatar || null }, stories, allSeen: stories.every((s) => s.seen), latest: rows[rows.length - 1].created_at });
+    friends.push({ user: { id: u.id, nickname: u.nickname, avatar: u.avatar || null, savedName: (q('SELECT name FROM contact_names WHERE user_id = ? AND contact_id = ?').get(user.id, u.id) || {}).name || null }, stories, allSeen: stories.every((s) => s.seen), latest: rows[rows.length - 1].created_at });
   }
   friends.sort((a, b) => (a.allSeen - b.allSeen) || (b.latest - a.latest));
   send(res, 200, { mine, friends });
@@ -911,11 +1178,12 @@ route('POST', '/api/stories/media', async (req, res, params, url) => {
   if (type === 'video' && !/^video\//.test(mime)) fail(400, 'That video type is not supported.');
   const dur = Math.round(Number(url.searchParams.get('dur')) || 0);
   if (type === 'video' && (dur < 1 || dur > STORY_MAX_VIDEO_SECONDS)) fail(400, 'Story videos can be up to ' + STORY_MAX_VIDEO_SECONDS + ' seconds.');
-  const { id } = await receiveUpload(req, MAX_UPLOAD[type]);
+  checkQuota(user, Number(req.headers['content-length']) || 0);
+  const { id, size } = await receiveUpload(req, MAX_UPLOAD[type]);
   const caption = String(url.searchParams.get('caption') || '').trim().slice(0, 300);
   const t = now();
-  const info = q('INSERT INTO stories (user_id, kind, text, media, mime, duration, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run(user.id, type, caption || null, id, mime, type === 'video' ? dur : null, t, t + STORY_MS);
+  const info = q('INSERT INTO stories (user_id, kind, text, media, mime, duration, created_at, expires_at, size) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(user.id, type, caption || null, id, mime, type === 'video' ? dur : null, t, t + STORY_MS, size);
   announceStory(user);
   send(res, 200, { story: storyShape(q('SELECT * FROM stories WHERE id = ?').get(Number(info.lastInsertRowid)), user.id) });
 });
@@ -1045,10 +1313,7 @@ route('POST', '/api/push/unsubscribe', async (req, res) => {
 });
 
 // ----- delete account -----
-route('POST', '/api/account/delete', async (req, res) => {
-  const user = needUser(req);
-  const b = await readJson(req);
-  if (String(b.nickname || '').trim().toLowerCase() !== user.nickname.toLowerCase()) fail(400, 'Type your nickname exactly to confirm.');
+function deleteUserData(user) {
   for (const c of q('SELECT id FROM chats WHERE user_a = ? OR user_b = ?').all(user.id, user.id)) {
     for (const m of q('SELECT id, media FROM messages WHERE chat_id = ?').all(c.id)) {
       rmMedia(m.media);
@@ -1061,16 +1326,177 @@ route('POST', '/api/account/delete', async (req, res) => {
     q('DELETE FROM chats WHERE id = ?').run(c.id);
   }
   for (const s of q('SELECT * FROM stories WHERE user_id = ?').all(user.id)) removeStory(s);
+  for (const st of q('SELECT media FROM stickers WHERE user_id = ?').all(user.id)) rmMedia(st.media);
+  q('DELETE FROM stickers WHERE user_id = ?').run(user.id);
   q('DELETE FROM story_views WHERE viewer_id = ?').run(user.id);
   q('DELETE FROM story_likes WHERE user_id = ?').run(user.id);
   q('DELETE FROM reactions WHERE user_id = ?').run(user.id);
   q('DELETE FROM stars WHERE user_id = ?').run(user.id);
+  q('DELETE FROM contact_names WHERE user_id = ? OR contact_id = ?').run(user.id, user.id);
+  q('DELETE FROM notices WHERE user_id = ?').run(user.id);
   q('DELETE FROM push_subs WHERE user_id = ?').run(user.id);
   q('DELETE FROM sessions WHERE user_id = ?').run(user.id);
   q('DELETE FROM users WHERE id = ?').run(user.id);
+  const set = conns.get(user.id); if (set) { for (const r of set) r.end(); conns.delete(user.id); }
+}
+route('POST', '/api/account/delete', async (req, res) => {
+  const user = needUser(req);
+  const b = await readJson(req);
+  if (String(b.nickname || '').trim().toLowerCase() !== user.nickname.toLowerCase()) fail(400, 'Type your nickname exactly to confirm.');
+  deleteUserData(user);
   res.setHeader('Set-Cookie', 'b1t3=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
   send(res, 200, { ok: true });
 });
+
+// ----- your own stickers (made from photos, cropped on the phone) -----
+const MAX_STICKERS = 100, MAX_STICKER_BYTES = 300e3;
+route('GET', '/api/stickers', async (req, res) => {
+  const user = needUser(req);
+  send(res, 200, { stickers: q('SELECT id, created_at FROM stickers WHERE user_id = ? ORDER BY id DESC').all(user.id).map((r) => ({ id: r.id, createdAt: r.created_at })), max: MAX_STICKERS });
+});
+route('POST', '/api/stickers', async (req, res) => {
+  const user = needUser(req);
+  userLimit(user, 'sticker', 30, 3600e3);
+  const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (!/^image\/(png|webp|jpeg)$/.test(mime)) fail(400, 'Stickers must be a PNG, WebP or JPEG image.');
+  if (q('SELECT COUNT(*) n FROM stickers WHERE user_id = ?').get(user.id).n >= MAX_STICKERS) fail(400, 'You can keep up to ' + MAX_STICKERS + ' stickers. Delete some to add more.');
+  checkQuota(user, Number(req.headers['content-length']) || 0);
+  const { id, size } = await receiveUpload(req, MAX_STICKER_BYTES);
+  const info = q('INSERT INTO stickers (user_id, media, mime, size, created_at) VALUES (?,?,?,?,?)').run(user.id, id, mime, size, now());
+  send(res, 200, { sticker: { id: Number(info.lastInsertRowid) } });
+});
+route('DELETE', '/api/stickers/:id', async (req, res, params) => {
+  const user = needUser(req);
+  const st = q('SELECT * FROM stickers WHERE id = ? AND user_id = ?').get(Number(params.id), user.id);
+  if (st) { rmMedia(st.media); q('DELETE FROM stickers WHERE id = ?').run(st.id); }
+  send(res, 200, { ok: true });
+});
+route('POST', '/api/messages/:id/save-sticker', async (req, res, params) => { // save a sticker someone sent you
+  const user = needUser(req);
+  const { m } = getMessageFor(user, params.id);
+  if (m.type !== 'sticker' || !m.media || m.deleted_all) fail(400, 'That isn’t a saved-able sticker.');
+  if (q('SELECT COUNT(*) n FROM stickers WHERE user_id = ?').get(user.id).n >= MAX_STICKERS) fail(400, 'You can keep up to ' + MAX_STICKERS + ' stickers. Delete some to add more.');
+  checkQuota(user, m.size || 0);
+  const media = crypto.randomBytes(16).toString('hex');
+  try { fs.copyFileSync(path.join(MEDIA_DIR, m.media), path.join(MEDIA_DIR, media)); } catch { fail(410, 'That sticker is no longer available.'); }
+  const info = q('INSERT INTO stickers (user_id, media, mime, size, created_at) VALUES (?,?,?,?,?)').run(user.id, media, m.mime || 'image/png', m.size || 0, now());
+  send(res, 200, { sticker: { id: Number(info.lastInsertRowid) } });
+});
+function serveStickerMedia(req, res, id) {
+  const user = needUser(req);
+  const st = q('SELECT * FROM stickers WHERE id = ? AND user_id = ?').get(Number(id), user.id);
+  if (!st) fail(404, 'Sticker not found.');
+  sendStoredFile(req, res, st.media, st.mime, 'sticker', {});
+}
+
+// ----- errors seen on phones (so "it broke" can be investigated) -----
+route('POST', '/api/clientlog', async (req, res) => {
+  rateLimit(req, 'clog', 30, 600e3);
+  const b = await readJson(req, 20e3);
+  const u = authUser(req);
+  logLine('client' + (u ? ' u' + u.id : ''), [b.screen, b.message, b.stack, String(req.headers['user-agent'] || '').slice(0, 120)].map((x) => String(x || '').slice(0, 400)).join(' | '));
+  send(res, 200, { ok: true });
+});
+
+// ----- admin: reports and accounts (set ADMIN_KEY on the server to switch it on) -----
+function needAdmin(req) {
+  rateLimit(req, 'admin', 60, 600e3);
+  const k = String(req.headers['x-admin-key'] || '');
+  if (!ADMIN_KEY || k.length !== ADMIN_KEY.length || !crypto.timingSafeEqual(Buffer.from(k), Buffer.from(ADMIN_KEY))) fail(403, 'Not allowed.');
+}
+function suspendUser(id, on) {
+  q('UPDATE users SET suspended = ? WHERE id = ?').run(on ? 1 : 0, id);
+  if (!on) return;
+  q('DELETE FROM sessions WHERE user_id = ?').run(id);
+  q('DELETE FROM push_subs WHERE user_id = ?').run(id);
+  for (const st of q('SELECT * FROM stories WHERE user_id = ?').all(id)) removeStory(st);
+  const set = conns.get(id); if (set) { for (const r of set) r.end(); conns.delete(id); }
+  broadcastPresence(id);
+}
+route('GET', '/api/admin/reports', async (req, res, params, url) => {
+  needAdmin(req);
+  const all = url.searchParams.get('status') === 'all';
+  const rows = q(`SELECT r.*, a.nickname AS reporter_nick, b.nickname AS reported_nick, b.suspended, b.limited
+    FROM reports r LEFT JOIN users a ON a.id = r.reporter LEFT JOIN users b ON b.id = r.reported
+    ${all ? '' : "WHERE r.status = 'open'"} ORDER BY r.id DESC LIMIT 200`).all();
+  send(res, 200, { reports: rows.map((r) => ({
+    id: r.id, status: r.status, action: r.action, reason: r.reason, createdAt: r.created_at,
+    reporter: { id: r.reporter, nickname: r.reporter_nick || '(deleted)' }, reported: { id: r.reported, nickname: r.reported_nick || '(deleted)', suspended: !!r.suspended, limited: !!r.limited },
+    distinctReporters7d: q('SELECT COUNT(DISTINCT reporter) n FROM reports WHERE reported = ? AND created_at > ?').get(r.reported, now() - 7 * 86400e3).n,
+    reportsByReporter30d: q('SELECT COUNT(*) n FROM reports WHERE reporter = ? AND created_at > ?').get(r.reporter, now() - 30 * 86400e3).n,
+    context: r.context ? JSON.parse(r.context) : null
+  })) });
+});
+route('POST', '/api/admin/reports/:id', async (req, res, params) => {
+  needAdmin(req);
+  const b = await readJson(req);
+  const r = q('SELECT * FROM reports WHERE id = ?').get(Number(params.id));
+  if (!r) fail(404, 'Report not found.');
+  const action = String(b.action || '');
+  const target = q('SELECT * FROM users WHERE id = ?').get(r.reported);
+  let note = 'We reviewed your report. Thank you for letting us know.';
+  if (action === 'warn' && target) { addNotice(target.id, 'warn', 'We received a report about your behavior. Please follow the community rules. Repeated reports can lead to your account being suspended.'); note = 'We took action on your report. Thank you.'; }
+  else if (action === 'suspend' && target) { suspendUser(target.id, true); note = 'We took action on your report. Thank you.'; }
+  else if (action === 'delete' && target) { deleteUserData(target); note = 'We took action on your report. Thank you.'; }
+  else if (action !== 'dismiss') fail(400, 'Unknown action.');
+  q("UPDATE reports SET status = 'closed', action = ?, handled_at = ? WHERE reported = ? AND status = 'open' AND (id = ? OR ? != 'dismiss')").run(action, now(), r.reported, r.id, action);
+  addNotice(r.reporter, 'report-update', note);
+  logLine('admin', action + ' on user ' + r.reported + ' (report ' + r.id + ')');
+  send(res, 200, { ok: true });
+});
+route('GET', '/api/admin/users', async (req, res, params, url) => {
+  needAdmin(req);
+  const term = '%' + String(url.searchParams.get('q') || '').replace(/[\\%_]/g, '\\$&') + '%';
+  const rows = q("SELECT id, nickname, created_at, last_seen, suspended, limited FROM users WHERE nickname LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 50").all(term);
+  send(res, 200, { users: rows.map((u) => ({ id: u.id, nickname: u.nickname, createdAt: u.created_at, lastSeen: u.last_seen, suspended: !!u.suspended, limited: !!u.limited, storageUsed: usedBytes(u.id) })) });
+});
+route('POST', '/api/admin/users/:id', async (req, res, params) => {
+  needAdmin(req);
+  const b = await readJson(req);
+  const u = q('SELECT * FROM users WHERE id = ?').get(Number(params.id));
+  if (!u) fail(404, 'No such account.');
+  if (b.action === 'suspend') suspendUser(u.id, true);
+  else if (b.action === 'unsuspend') suspendUser(u.id, false);
+  else if (b.action === 'unlimit') q('UPDATE users SET limited = 0 WHERE id = ?').run(u.id);
+  else fail(400, 'Unknown action.');
+  logLine('admin', b.action + ' on user ' + u.id);
+  send(res, 200, { ok: true });
+});
+route('GET', '/api/admin/stats', async (req, res) => {
+  needAdmin(req);
+  send(res, 200, { users: q('SELECT COUNT(*) n FROM users').get().n, chats: q('SELECT COUNT(*) n FROM chats').get().n, messages: q('SELECT COUNT(*) n FROM messages').get().n,
+    mediaBytes: q('SELECT COALESCE(SUM(size),0) n FROM messages').get().n, online: conns.size, openReports: q("SELECT COUNT(*) n FROM reports WHERE status = 'open'").get().n });
+});
+route('GET', '/api/admin/logs', async (req, res) => {
+  needAdmin(req);
+  let text = ''; try { text = fs.readFileSync(LOG_FILE, 'utf8'); } catch { /* none yet */ }
+  send(res, 200, { lines: text.split('\n').filter(Boolean).slice(-200) });
+});
+
+const ADMIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>MAJB1T3 admin</title>
+<style>body{font-family:system-ui,sans-serif;background:#0B1210;color:#E8F5EF;margin:0;padding:16px;max-width:760px;margin:auto}h1{font-size:20px}h2{font-size:15px;color:#4DE3A2;margin-top:28px}
+input,button{font:inherit;border-radius:10px;border:1px solid #25382F;background:#121E1A;color:inherit;padding:10px 12px}button{cursor:pointer}button.go{background:#4DE3A2;color:#06130E;border:0;font-weight:700}button.bad{color:#FF8F7A}
+.card{border:1px solid #1E2E29;background:#0F1916;border-radius:14px;padding:14px;margin:10px 0}.muted{color:#9DB5AB;font-size:13px}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}pre{white-space:pre-wrap;background:#121E1A;padding:10px;border-radius:10px;font-size:12px;max-height:200px;overflow:auto}</style></head><body>
+<h1>MAJB1T3 admin</h1><div id="login"><input id="key" type="password" placeholder="Admin key" autocomplete="off"> <button class="go" id="enter">Open</button><div class="muted" id="msg"></div></div>
+<div id="main" hidden><div class="card" id="stats"></div><h2>Open reports</h2><div id="reports"></div><h2>Find an account</h2><input id="uq" placeholder="Nickname"> <button id="find">Search</button><div id="users"></div><h2>Recent errors</h2><pre id="logs"></pre></div>
+<script>
+const $=(i)=>document.getElementById(i);let KEY=sessionStorage.getItem('k')||'';
+async function api(m,p,b){const r=await fetch(p,{method:m,headers:{'x-admin-key':KEY,'content-type':'application/json'},body:b?JSON.stringify(b):undefined});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.status);return d}
+function el(t,txt,c){const e=document.createElement(t);if(txt!=null)e.textContent=txt;if(c)e.className=c;return e}
+function btn(l,fn,c){const b=el('button',l,c);b.onclick=async()=>{try{await fn();load()}catch(e){alert(e.message)}};return b}
+async function load(){try{const st=await api('GET','/api/admin/stats');$('login').hidden=true;$('main').hidden=false;sessionStorage.setItem('k',KEY);
+$('stats').textContent=st.users+' accounts · '+st.chats+' chats · '+st.messages+' messages · '+Math.round(st.mediaBytes/1e6)+' MB media · '+st.online+' online · '+st.openReports+' open reports';
+const rp=await api('GET','/api/admin/reports');const box=$('reports');box.replaceChildren();if(!rp.reports.length)box.append(el('div','No open reports.','muted'));
+for(const r of rp.reports){const c=el('div',null,'card');c.append(el('b',r.reported.nickname+(r.reported.suspended?' (suspended)':'')+(r.reported.limited?' (limited)':'')),el('div','Reported by '+r.reporter.nickname+' · '+new Date(r.createdAt).toLocaleString(),'muted'),el('div','Reason: '+r.reason),
+el('div',r.distinctReporters7d+' different people reported this account in 7 days · '+r.reporter.nickname+' made '+r.reportsByReporter30d+' report(s) in 30 days','muted'));
+if(r.context){const t=r.context.map(x=>new Date(x.at).toLocaleString()+'  '+x.text).join('\\n');c.append(el('pre',t))}
+const row=el('div',null,'row');row.append(btn('Dismiss',()=>api('POST','/api/admin/reports/'+r.id,{action:'dismiss'})),btn('Warn',()=>api('POST','/api/admin/reports/'+r.id,{action:'warn'})),btn('Suspend',()=>api('POST','/api/admin/reports/'+r.id,{action:'suspend'}),'bad'),btn('Delete account',()=>confirm('Delete this account and all its data?')&&api('POST','/api/admin/reports/'+r.id,{action:'delete'}),'bad'));c.append(row);box.append(c)}
+const lg=await api('GET','/api/admin/logs');$('logs').textContent=lg.lines.slice(-60).join('\\n')||'No errors logged.'}catch(e){$('login').hidden=false;$('main').hidden=true;$('msg').textContent=KEY?e.message:''}}
+$('enter').onclick=()=>{KEY=$('key').value;load()};$('key').onkeydown=(e)=>{if(e.key==='Enter')$('enter').click()};
+$('find').onclick=async()=>{try{const d=await api('GET','/api/admin/users?q='+encodeURIComponent($('uq').value));const b=$('users');b.replaceChildren();for(const u of d.users){const c=el('div',null,'card');c.append(el('b',u.nickname+' (#'+u.id+')'),el('div',(u.suspended?'suspended · ':'')+(u.limited?'limited · ':'')+Math.round(u.storageUsed/1e6)+' MB · joined '+new Date(u.createdAt).toLocaleDateString(),'muted'));const row=el('div',null,'row');
+row.append(u.suspended?btn('Unsuspend',()=>api('POST','/api/admin/users/'+u.id,{action:'unsuspend'})):btn('Suspend',()=>api('POST','/api/admin/users/'+u.id,{action:'suspend'}),'bad'));if(u.limited)row.append(btn('Remove limit',()=>api('POST','/api/admin/users/'+u.id,{action:'unlimit'})));c.append(row);b.append(c)}}catch(e){alert(e.message)}};
+if(KEY)load();
+</script></body></html>`;
 
 // ---------- files ----------
 const MIME_TYPES = {
@@ -1085,6 +1511,7 @@ function sendStoredFile(req, res, mediaId, mime, fileName, opts) {
   const inline = /^(image\/(jpeg|png|webp|gif|heic|heif)|audio\/|video\/)/.test(mime || '');
   const headers = {
     'Content-Type': inline ? mime : 'application/octet-stream', 'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; sandbox",
     'Cache-Control': opts.noStore ? 'no-store' : 'private, max-age=3600', 'Accept-Ranges': opts.noStore ? 'none' : 'bytes',
     'Content-Disposition': (inline ? 'inline' : 'attachment') + '; filename="' + encodeURIComponent(fileName || 'file') + '"'
   };
@@ -1161,6 +1588,11 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname.startsWith('/media/')) { serveMedia(req, res, url.pathname.slice(7)); return; }
     if (url.pathname.startsWith('/story-media/')) { serveStoryMedia(req, res, url.pathname.slice(13)); return; }
+    if (url.pathname.startsWith('/sticker-media/')) { serveStickerMedia(req, res, url.pathname.slice(15)); return; }
+    if (url.pathname === '/admin') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
+      res.end(ADMIN_HTML); return;
+    }
     if (url.pathname === '/health') { send(res, 200, 'ok'); return; }
     if (url.pathname.startsWith('/api/')) {
       for (const r of routes) {
@@ -1174,7 +1606,7 @@ const server = http.createServer(async (req, res) => {
     serveStatic(req, res, url.pathname);
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500;
-    if (!(e instanceof HttpError)) console.error(e);
+    if (!(e instanceof HttpError)) { console.error(e); logLine('error', req.method + ' ' + url.pathname + ' ' + (e && e.stack || e)); }
     if (res.headersSent) { res.end(); return; }
     send(res, status, { error: e instanceof HttpError ? e.message : 'Something went wrong on our side.' });
   }
@@ -1195,4 +1627,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log('MAJB1T3 Chat running on port ' + PORT + ' (data: ' + DATA_DIR + ', email codes: ' + (MAIL_ENABLED ? 'on' : 'off') + ')'));
 }
 module.exports = server;
-module.exports._test = { encryptPush, checkCode };
+module.exports._test = { encryptPush, checkCode, vagueSeen };
